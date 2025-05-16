@@ -36,7 +36,12 @@ def download_audio(url, dest_path):
     if not r.ok:
         raise RuntimeError(f"Failed to download audio. Status: {r.status_code}")
     content_type = r.headers.get("Content-Type", "")
+    audio_exts = (".mp3", ".aac", ".m4a", ".wav", ".ogg", ".flac")
     if "audio" not in content_type:
+        # Accept application/octet-stream for audio-like files
+        if content_type == "application/octet-stream" and str(dest_path).lower().endswith(audio_exts):
+            pass  # Accept it!
+    else:
         raise RuntimeError(f"Expected audio content, got: {content_type}")
     dest_path.write_bytes(r.content)
     if dest_path.stat().st_size < 1024:
@@ -44,20 +49,50 @@ def download_audio(url, dest_path):
 
 def convert_audio_to_aac(input_audio, output_audio):
     subprocess.run([
-        "ffmpeg", "-y", "-i", str(input_audio),
-        "-c:a", "aac", "-b:a", "192k",
+        "ffmpeg", "-y",
+        "-i", str(input_audio),
+        "-vn",
+        "-acodec", "aac",
+        "-ac", "2",
+        "-ar", "44100",
+        "-b:a", "192k",
         str(output_audio)
     ], check=True)
 
 def mux_video_with_aac_audio(video_path, audio_path, output_path):
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(video_path),
-        "-i", str(audio_path),
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        str(output_path)
-    ], check=True)
+    # If input video is webm, re-encode video to mp4 first
+    video_ext = video_path.suffix.lower()
+    if video_ext == ".webm":
+        # Temporary .mp4 video file
+        mp4_video = video_path.with_name("__temp_video.mp4")
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-an",  # remove audio
+            str(mp4_video)
+        ], check=True)
+        # Now mux the audio and the new .mp4 video
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(mp4_video),
+            "-i", str(audio_path),
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            str(output_path)
+        ], check=True)
+        # Clean up temp file
+        if mp4_video.exists():
+            mp4_video.unlink()
+    else:
+        # Already mp4, just mux as before
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-i", str(audio_path),
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            str(output_path)
+        ], check=True)
 
 def get_script_directory():
     return Path(__file__).resolve().parent
