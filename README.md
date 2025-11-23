@@ -1,13 +1,15 @@
 # 4chan Soundpost Tool
 
-A simple GUI tool for creating and extracting 4chan-style soundposts.
+A simple GUI tool for creating and extracting 4chan-style soundposts with configurable limits and safer defaults.
 
 ## Features
 
-- Extracts and uploads audio to catbox.moe
-- Injects sound from catbox.moe into silent video files
-- Fully dark mode GUI, mnyes
-- Simple and cross-platform
+- Extracts and uploads audio to catbox.moe with validation
+- Injects sound from catbox.moe into video files or still images
+- Lets you pick the output container (MP4 or WebM) and a custom size cap
+- Uses temporary working directories instead of polluting the repo folder
+- Status log keeps a running record of each step for easier troubleshooting
+- Fully dark mode GUI, simple and cross-platform
 
 ## Requirements
 
@@ -42,9 +44,19 @@ A simple GUI tool for creating and extracting 4chan-style soundposts.
 ## Usage
 
 1. **Run the tool:**
-    python soundpost_gui.py
+   ```
+   python soundpost_gui.py
+   ```
 
-2. **Use the GUI!**
+2. **Choose a source file** (video or still image). If the filename already contains a `[sound=URL]` tag, the Inject mode will download and mux that audio. Extraction mode requires a video input.
+   - You can start from a still image to build a video with the tagged audio.
+
+3. **Pick options:**
+   - *Target max file size (MB)* controls how aggressively the video is recompressed when stripping audio.
+   - *Output container* lets you keep MP4 or WebM workflows consistent with the file extension.
+   - *Preserve original file* toggles whether the source is kept alongside the newly produced soundpost.
+
+4. **Click Run** and watch the status log for progress and errors.
 
 ---
 

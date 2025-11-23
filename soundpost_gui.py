@@ -1,81 +1,76 @@
-from ttkthemes import ThemedTk
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from pathlib import Path
-import subprocess
-import requests
+import mimetypes
 import re
-import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import urllib.parse
-import mimetypes
+from dataclasses import dataclass
+from pathlib import Path
 
-# === Utility functions ===
+import requests
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from ttkthemes import ThemedTk
 
-def get_file_mimetype(path):
+# ==== Configuration ====
+DEFAULT_TARGET_MB = 4
+DEFAULT_CONTAINER = "mp4"
+CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
+REQUEST_TIMEOUT = 30
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # 200MB safety cap
+SUPPORTED_VIDEO_TYPES = {"video/mp4", "video/webm"}
+SUPPORTED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp"}
+
+
+# ==== Utility helpers ====
+def detect_mime(path: Path) -> str:
     mime, _ = mimetypes.guess_type(str(path))
     return mime or ""
 
-def is_video_file(path):
-    mime = get_file_mimetype(path)
-    return mime.startswith("video/")
 
-def is_audio_file(path):
-    mime = get_file_mimetype(path)
-    return mime.startswith("audio/")
-
-def prepare_audio_for_muxing(source_path, output_aac_path, force_aac=True):
-    """
-    Given any file (audio or video), extract and convert audio to AAC.
-    - If input is video, extract audio stream first.
-    - If input is audio, convert directly.
-    Output: output_aac_path (AAC .aac file for muxing with MP4)
-    """
-    if is_video_file(source_path):
-        # Try to extract audio, then convert
-        # First, extract audio to wav (universal intermediate)
-        temp_wav = output_aac_path.with_suffix(".temp.wav")
-        probe = subprocess.run([
-            "ffprobe", "-v", "error", "-select_streams", "a",
-            "-show_entries", "stream=index", "-of", "csv=p=0", str(source_path)
-        ], capture_output=True, text=True)
-        if not probe.stdout.strip():
-            raise RuntimeError("No audio stream found in the video. Extraction aborted.")
-
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(source_path), "-vn", "-acodec", "pcm_s16le", str(temp_wav)
-        ], check=True)
-        # Now, convert wav to AAC
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(temp_wav),
-            "-acodec", "aac", "-ac", "2", "-ar", "44100", "-b:a", "192k", str(output_aac_path)
-        ], check=True)
-        temp_wav.unlink()
-    elif is_audio_file(source_path):
-        # Convert any audio directly to AAC (ffmpeg will handle weird formats)
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(source_path),
-            "-acodec", "aac", "-ac", "2", "-ar", "44100", "-b:a", "192k", str(output_aac_path)
-        ], check=True)
-    else:
-        # fallback: try as audio anyway (some rare files have no mime)
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(source_path),
-            "-acodec", "aac", "-ac", "2", "-ar", "44100", "-b:a", "192k", str(output_aac_path)
-        ], check=True)
-
-def ffmpeg_installed():
+def ensure_ffmpeg() -> bool:
     try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True)
-        subprocess.run(['ffprobe', '-version'], capture_output=True)
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return True
-    except Exception:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
-def extract_sound_url(filename):
-    match = re.search(r'\[sound\s*=\s*(.*?)\]', filename, flags=re.IGNORECASE)
+
+def run_ffmpeg(args):
+    subprocess.run(args, check=True)
+
+
+def probe_duration(path: Path) -> float:
+    proc = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        raise RuntimeError("Could not determine media duration.")
+
+
+def safe_tempdir() -> tempfile.TemporaryDirectory:
+    return tempfile.TemporaryDirectory(prefix="soundpost_")
+
+
+def extract_sound_url(filename: str) -> str | None:
+    match = re.search(r"\[sound\s*=\s*(.*?)\]", filename, flags=re.IGNORECASE)
     if match:
         url = urllib.parse.unquote(match.group(1).strip())
         if not url.startswith("http"):
@@ -83,326 +78,534 @@ def extract_sound_url(filename):
         return url
     return None
 
-def download_audio(url, dest_path):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers)
-    if not r.ok:
-        raise RuntimeError(f"Failed to download audio. Status: {r.status_code}")
-    content_type = r.headers.get("Content-Type", "")
-    audio_exts = (".mp3", ".aac", ".m4a", ".wav", ".ogg", ".flac")
-    if not (content_type.startswith("audio/") or
-            (content_type == "application/octet-stream" and str(dest_path).lower().endswith(audio_exts))):
-        raise RuntimeError(f"Expected audio content, got: {content_type}")
-    dest_path.write_bytes(r.content)
+
+def download_audio(url: str, dest_path: Path):
+    with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+        if not resp.ok:
+            raise RuntimeError(f"Failed to download audio ({resp.status_code}).")
+        content_length = resp.headers.get("Content-Length")
+        if content_length and int(content_length) > MAX_DOWNLOAD_BYTES:
+            raise RuntimeError("Audio file too large to download safely.")
+        written = 0
+        with dest_path.open("wb") as fh:
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    fh.write(chunk)
+                    written += len(chunk)
+                    if written > MAX_DOWNLOAD_BYTES:
+                        raise RuntimeError("Download exceeded safety limit.")
+    mime = resp.headers.get("Content-Type", "")
+    if not (mime.startswith("audio/") or mime == "application/octet-stream"):
+        raise RuntimeError(f"Unexpected content type: {mime}")
     if dest_path.stat().st_size < 1024:
-        raise RuntimeError("Downloaded file is too small to be a valid audio file.")
+        raise RuntimeError("Downloaded audio is unexpectedly small.")
 
-def convert_audio_to_aac(input_audio, output_audio):
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", str(input_audio),
-        "-vn",
-        "-acodec", "aac",
-        "-ac", "2",
-        "-ar", "44100",
-        "-b:a", "192k",
-        str(output_audio)
-    ], check=True)
 
-def mux_video_with_aac_audio(video_path, audio_path, output_path):
-    # If input video is webm, re-encode video to mp4 first
-    video_ext = video_path.suffix.lower()
-    if video_ext == ".webm":
-        # Temporary .mp4 video file
-        mp4_video = video_path.with_name("__temp_video.mp4")
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(video_path),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-an",  # remove audio
-            str(mp4_video)
-        ], check=True)
-        # Now mux the audio and the new .mp4 video
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(mp4_video),
-            "-i", str(audio_path),
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-shortest",
-            str(output_path)
-        ], check=True)
-        # Clean up temp file
-        if mp4_video.exists():
-            mp4_video.unlink()
-    else:
-        # Already mp4, just mux as before
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(video_path),
-            "-i", str(audio_path),
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-shortest",
-            str(output_path)
-        ], check=True)
-
-def get_script_directory():
-    return Path(__file__).resolve().parent
-
-def extract_audio_ffmpeg(video_path, output_audio_path):
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "libmp3lame",
-        str(output_audio_path)
-    ], check=True)
-
-def upload_to_catbox(audio_path):
-    url = 'https://catbox.moe/user/api.php'
-    with open(audio_path, 'rb') as f:
-        files = {'fileToUpload': f}
-        data = {'reqtype': 'fileupload'}
-        response = requests.post(url, files=files, data=data)
-    if response.status_code != 200:
-        raise RuntimeError("Catbox upload failed.")
-    return response.text.strip()
-
-def compress_and_strip_audio(input_path, output_path, target_size_mb=4):
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-an",
-        "-c:v", "libx264",
-        "-crf", "28",
-        "-preset", "fast",
-        "-movflags", "+faststart",
-        str(output_path)
-    ], check=True)
-    if output_path.stat().st_size > target_size_mb * 1024 * 1024:
-        print("⚠️ CRF output too large, retrying with bitrate-based compression...")
-        duration_cmd = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)],
-            capture_output=True, text=True
+def upload_to_catbox(audio_path: Path) -> str:
+    with audio_path.open("rb") as f:
+        resp = requests.post(
+            CATBOX_UPLOAD_URL,
+            files={"fileToUpload": f},
+            data={"reqtype": "fileupload"},
+            timeout=REQUEST_TIMEOUT,
         )
-        duration = float(duration_cmd.stdout.strip())
-        target_bitrate = int((target_size_mb * 8 * 1024 * 1024) / duration)
-        target_bitrate = max(100_000, min(target_bitrate, 1_500_000))
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(input_path),
-            "-an", "-c:v", "libx264",
-            "-b:v", f"{target_bitrate}",
-            "-preset", "fast",
-            "-movflags", "+faststart",
-            str(output_path)
-        ], check=True)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Catbox upload failed ({resp.status_code}).")
+    body = resp.text.strip()
+    if not body.startswith("http"):
+        raise RuntimeError("Catbox returned an unexpected response.")
+    return body
 
-# === GUI Logic ===
 
-class SoundpostTool:
-    def __init__(self, root):
+def convert_audio_to_aac(input_audio: Path, output_audio: Path):
+    run_ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_audio),
+            "-vn",
+            "-acodec",
+            "aac",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-b:a",
+            "192k",
+            str(output_audio),
+        ]
+    )
+
+
+def convert_audio_to_opus(input_audio: Path, output_audio: Path):
+    run_ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_audio),
+            "-vn",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "160k",
+            str(output_audio),
+        ]
+    )
+
+
+def build_video_from_image(image_path: Path, audio_path: Path, output_path: Path, container: str):
+    duration = probe_duration(audio_path)
+    video_codec = "libx264" if container == "mp4" else "libvpx-vp9"
+    run_ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-loop",
+            "1",
+            "-framerate",
+            "2",
+            "-t",
+            str(duration),
+            "-i",
+            str(image_path),
+            "-i",
+            str(audio_path),
+            "-c:v",
+            video_codec,
+            "-tune",
+            "stillimage",
+            "-c:a",
+            "copy",
+            "-shortest",
+            str(output_path),
+        ]
+    )
+
+
+def mux_video_and_audio(video_path: Path, audio_path: Path, output_path: Path, container: str):
+    # Always re-encode to avoid container mismatches and to normalize streams.
+    video_codec = "libx264" if container == "mp4" else "libvpx-vp9"
+    audio_codec = "aac" if container == "mp4" else "libopus"
+    run_ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            video_codec,
+            "-c:a",
+            audio_codec,
+            "-shortest",
+            str(output_path),
+        ]
+    )
+
+
+def strip_audio_and_compress(video_path: Path, output_path: Path, container: str, target_mb: int):
+    video_codec = "libx264" if container == "mp4" else "libvpx-vp9"
+    def encode_crf(crf_value: int):
+        args = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-an",
+            "-c:v",
+            video_codec,
+            "-crf",
+            str(crf_value),
+            "-preset",
+            "fast",
+        ]
+        if container == "mp4":
+            args.extend(["-movflags", "+faststart"])
+        args.append(str(output_path))
+        run_ffmpeg(args)
+
+    def encode_bitrate(bitrate: int):
+        # Constrain the maxrate/bufsize to keep the output under the requested cap.
+        args = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-an",
+            "-c:v",
+            video_codec,
+            "-b:v",
+            str(bitrate),
+            "-maxrate",
+            str(bitrate),
+            "-bufsize",
+            str(bitrate * 2),
+            "-preset",
+            "fast",
+        ]
+        if container == "mp4":
+            args.extend(["-movflags", "+faststart"])
+        args.append(str(output_path))
+        run_ffmpeg(args)
+
+    max_bytes = target_mb * 1024 * 1024
+    encode_crf(30)
+    if output_path.stat().st_size <= max_bytes:
+        return
+
+    duration = probe_duration(video_path)
+    if duration <= 0:
+        raise RuntimeError("Could not determine video duration for size targeting.")
+
+    target_bitrate = int((target_mb * 8 * 1024 * 1024) / duration)
+    target_bitrate = max(120_000, min(target_bitrate, 1_500_000))
+
+    # Try up to three bitrate passes, tightening bitrate if we overshoot.
+    bitrate = int(target_bitrate * 0.94)  # leave headroom for container overhead
+    for _ in range(3):
+        encode_bitrate(bitrate)
+        size = output_path.stat().st_size
+        if size <= max_bytes:
+            return
+        # Scale bitrate down based on how much we exceeded the cap.
+        reduction = max_bytes / size
+        bitrate = max(120_000, int(bitrate * reduction * 0.9))
+
+    raise RuntimeError("Compressed video still exceeds the target size.")
+
+
+def clean_stem(name: str) -> str:
+    return re.sub(r"\[sound=.*?\]", "", name, flags=re.IGNORECASE).strip()
+
+
+@dataclass
+class JobConfig:
+    source_path: Path
+    mode: str  # "inject" or "extract"
+    preserve_original: bool
+    target_mb: int
+    container: str
+
+
+# ==== Application ====
+class SoundpostApp:
+    def __init__(self, root: ThemedTk):
         self.root = root
+        self.ui_thread = threading.current_thread()
         self.root.title("4chan Soundpost Tool")
-
-        self.root.geometry("480x370")
-        self.root.minsize(480, 350)
-        self.root.resizable(True, True)
-        self.root.configure(bg="#000000")  # Absolute black
-
-        # Set theme to Equilux (ultra dark)
+        self.root.geometry("640x560")
+        self.root.minsize(600, 520)
         try:
             self.root.set_theme("equilux")
         except Exception:
             pass
 
-        # ==== File Selection Frame ====
-        file_frame = ttk.LabelFrame(self.root, text="Step 1: Choose a Video File")
-        file_frame.pack(fill='x', padx=16, pady=(16, 8))
-        file_frame.config(style='TLabelframe')
-        self._set_dark_bg(file_frame)
+        self.video_path: Path | None = None
+        self._build_ui()
 
-        self.video_label = ttk.Label(file_frame, text="No video file selected.")
-        self.video_label.pack(anchor='w', padx=8, pady=(4,2))
-
-        ttk.Button(file_frame, text="Browse...", command=self.select_video).pack(anchor='e', padx=8, pady=4)
-
-        # ==== Mode and Options Frame ====
-        options_frame = ttk.LabelFrame(self.root, text="Step 2: Select Action")
-        options_frame.pack(fill='x', padx=16, pady=8)
-        options_frame.config(style='TLabelframe')
-        self._set_dark_bg(options_frame)
-
-        self.mode = tk.StringVar(value="inject")
-        modes = [("Inject audio from soundpost", "inject"),
-                 ("Extract audio and prepare soundpost", "extract")]
-        for text, value in modes:
-            ttk.Radiobutton(options_frame, text=text, variable=self.mode, value=value).pack(anchor='w', padx=8, pady=2)
-
-        self.preserve_original = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options_frame, text="Preserve original video file", variable=self.preserve_original).pack(anchor='w', padx=8, pady=(8, 2))
-
-        # ==== Action Buttons ====
-        action_frame = ttk.Frame(self.root)
-        action_frame.pack(fill='x', padx=16, pady=(8, 8))
-        self._set_dark_bg(action_frame)
-        ttk.Button(action_frame, text="Run", command=self.run, width=12).pack(side='left', padx=(0,8))
-        ttk.Button(action_frame, text="Quit", command=self.root.quit, width=12).pack(side='left')
-
-        # ==== Separator ====
-        ttk.Separator(self.root, orient='horizontal').pack(fill='x', padx=0, pady=(2,0))
-
-        # ==== Status Bar as Scrollable Text ====
-        status_frame = ttk.Frame(self.root)
-        status_frame.pack(side='bottom', fill='both', expand=True, padx=0, pady=(0,2))
-        self._set_dark_bg(status_frame)
-
-        self.status_text = tk.Text(
-            status_frame, height=3, wrap='word',
-            font=("Segoe UI", 10), relief='flat', borderwidth=0,
-            bg="#000000", fg="#eeeeee", insertbackground="#eeeeee"
-        )
-        self.status_text.pack(side='left', fill='both', expand=True, padx=(2,0))
-        self.status_text.insert('end', "Status: Waiting for input.")
-        self.status_text.config(state='disabled')
-
-        scrollbar = ttk.Scrollbar(status_frame, command=self.status_text.yview)
-        scrollbar.pack(side='right', fill='y')
-        self.status_text.config(yscrollcommand=scrollbar.set)
-
-        ttk.Button(status_frame, text="Copy Status", width=12, command=self.copy_status).pack(side='right', padx=(6,6), pady=(0,4))
-
-        # ==== FFMPEG check ====
-        if not ffmpeg_installed():
-            messagebox.showerror("Error", "ffmpeg/ffprobe not found in PATH. Please install ffmpeg to use this tool.")
+        if not ensure_ffmpeg():
+            messagebox.showerror("ffmpeg missing", "ffmpeg/ffprobe not found in PATH. Please install them to continue.")
             self.root.destroy()
 
-    def _set_dark_bg(self, frame):
-        try:
-            frame.configure(bg="#000000")
-        except Exception:
-            pass
+    # ---- UI setup ----
+    def _build_ui(self):
+        style = ttk.Style()
+        style.configure("TFrame", background="#1e1e1e")
+        style.configure("TLabelframe", background="#1e1e1e", foreground="#f0f0f0")
+        style.configure("TLabelframe.Label", background="#1e1e1e", foreground="#f0f0f0")
+        style.configure("TLabel", background="#1e1e1e", foreground="#f0f0f0")
+        style.configure("TRadiobutton", background="#1e1e1e", foreground="#f0f0f0")
+        style.configure("TCheckbutton", background="#1e1e1e", foreground="#f0f0f0")
+        style.configure("TButton", padding=6)
+        style.configure("TSpinbox", arrowsize=12)
+        style.configure("TCombobox", arrowsize=12)
 
-    def set_status(self, msg):
-        self.status_text.config(state='normal')
-        self.status_text.delete("1.0", "end")
-        self.status_text.insert("end", str(msg))
-        self.status_text.config(state='disabled')
-        self.status_text.see("end")
-        print(msg)
-        self.root.update_idletasks()
+        root_frame = ttk.Frame(self.root)
+        root_frame.pack(fill="both", expand=True)
+
+        file_frame = ttk.LabelFrame(root_frame, text="Step 1: Choose a source")
+        file_frame.pack(fill="x", padx=16, pady=(16, 8))
+
+        file_inner = ttk.Frame(file_frame)
+        file_inner.pack(fill="x", padx=8, pady=4)
+
+        self.video_label = ttk.Label(file_inner, text="No file selected.")
+        self.video_label.grid(row=0, column=0, sticky="w")
+
+        ttk.Button(file_inner, text="Browse...", command=self.select_source).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        file_inner.columnconfigure(0, weight=1)
+
+        options_frame = ttk.LabelFrame(root_frame, text="Step 2: Choose action and options")
+        options_frame.pack(fill="x", padx=16, pady=8)
+
+        self.mode = tk.StringVar(value="inject")
+        mode_frame = ttk.Frame(options_frame)
+        mode_frame.pack(fill="x", padx=8, pady=(6, 4))
+        ttk.Radiobutton(mode_frame, text="Inject [sound] audio into file", variable=self.mode, value="inject").grid(
+            row=0, column=0, sticky="w", pady=2
+        )
+        ttk.Radiobutton(
+            mode_frame,
+            text="Extract audio, upload, and tag file",
+            variable=self.mode,
+            value="extract",
+        ).grid(row=1, column=0, sticky="w", pady=2)
+
+        config_frame = ttk.Frame(options_frame)
+        config_frame.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(config_frame, text="Target max file size (MB):").grid(row=0, column=0, sticky="w")
+        self.target_mb = tk.IntVar(value=DEFAULT_TARGET_MB)
+        ttk.Spinbox(config_frame, from_=1, to=100, width=6, textvariable=self.target_mb).grid(
+            row=0, column=1, sticky="w", padx=(8, 0)
+        )
+        ttk.Label(config_frame, text="Output container:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.container = tk.StringVar(value=DEFAULT_CONTAINER)
+        ttk.Combobox(
+            config_frame, values=["mp4", "webm"], textvariable=self.container, width=8, state="readonly"
+        ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        config_frame.columnconfigure(0, weight=1)
+
+        self.preserve_original = tk.BooleanVar(value=True)
+        ttk.Checkbutton(options_frame, text="Preserve original file", variable=self.preserve_original).pack(
+            anchor="w", padx=8, pady=(6, 4)
+        )
+
+        action_frame = ttk.Frame(root_frame)
+        action_frame.pack(fill="x", padx=16, pady=(8, 8))
+        ttk.Button(action_frame, text="Run", width=14, command=self.run).pack(side="left", padx=(0, 8))
+        ttk.Button(action_frame, text="Quit", width=14, command=self.root.quit).pack(side="left")
+
+        ttk.Separator(root_frame, orient="horizontal").pack(fill="x", pady=(2, 0))
+
+        status_frame = ttk.LabelFrame(root_frame, text="Status")
+        status_frame.pack(side="bottom", fill="both", expand=True, padx=16, pady=(8, 12))
+
+        log_container = ttk.Frame(status_frame)
+        log_container.pack(fill="both", expand=True, padx=6, pady=4)
+
+        self.status_text = tk.Text(
+            log_container,
+            height=10,
+            wrap="word",
+            font=("Segoe UI", 10),
+            relief="flat",
+            borderwidth=0,
+            bg="#111",
+            fg="#eee",
+            insertbackground="#eee",
+        )
+        self.status_text.grid(row=0, column=0, sticky="nsew")
+        self.status_text.insert("end", "Status log will appear here.\n")
+        self.status_text.config(state="disabled")
+
+        scrollbar = ttk.Scrollbar(log_container, command=self.status_text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.status_text.config(yscrollcommand=scrollbar.set)
+        log_container.columnconfigure(0, weight=1)
+        log_container.rowconfigure(0, weight=1)
+
+        ttk.Button(status_frame, text="Copy Status", width=14, command=self.copy_status).pack(
+            anchor="e", padx=8, pady=(0, 4)
+        )
+
+    # ---- UI helpers ----
+    def log(self, message: str):
+        def append():
+            self.status_text.config(state="normal")
+            self.status_text.insert("end", message + "\n")
+            self.status_text.config(state="disabled")
+            self.status_text.see("end")
+            print(message)
+
+        self._call_in_ui(append)
 
     def copy_status(self):
         text = self.status_text.get("1.0", "end").strip()
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
-        self.root.update()  # now it stays on the clipboard after quit
+        self.root.update()
 
-    def select_video(self):
-        file_path = filedialog.askopenfilename(filetypes=[("Video files", "*.webm *.mp4")])
+    def select_source(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[
+                ("Supported", "*.mp4 *.webm *.png *.jpg *.jpeg *.webp *.mp3 *.wav *.ogg *.m4a *.flac"),
+                ("All files", "*.*"),
+            ]
+        )
         if file_path:
             self.video_path = Path(file_path)
             self.video_label.config(text=f"Selected: {self.video_path.name}")
-            self.set_status(f"Ready to process: {self.video_path.name}")
+            self.log(f"Ready: {self.video_path.name}")
 
     def run(self):
-        if not hasattr(self, 'video_path') or not self.video_path:
-            messagebox.showerror("Error", "No video file selected.")
+        if not self.video_path:
+            messagebox.showerror("Error", "No file selected.")
             return
+        config = JobConfig(
+            source_path=self.video_path,
+            mode=self.mode.get(),
+            preserve_original=self.preserve_original.get(),
+            target_mb=max(1, int(self.target_mb.get() or DEFAULT_TARGET_MB)),
+            container=self.container.get(),
+        )
+        threading.Thread(target=self._run_job, args=(config,), daemon=True).start()
+
+    def _run_job(self, config: JobConfig):
         try:
-            self.root.config(cursor="wait")
-            if self.mode.get() == "inject":
-                self.inject_audio()
+            self._set_busy(True)
+            self.log("Starting job...")
+            if config.mode == "inject":
+                self._process_inject(config)
             else:
-                self.extract_audio()
-        except Exception as e:
-            import traceback
-            self.set_status(f"Error: {e}")
-            print(traceback.format_exc())
-            messagebox.showerror("Error", str(e))
+                self._process_extract(config)
+            self.log("Job completed.")
+        except Exception as exc:
+            self.log(f"Error: {exc}")
+            self._show_error(str(exc))
         finally:
-            self.root.config(cursor="")
+            self._set_busy(False)
 
-    def inject_audio(self):
-        self.set_status("Injecting audio...")
+    def _set_busy(self, busy: bool):
+        def toggle():
+            cursor = "wait" if busy else ""
+            self.root.config(cursor=cursor)
+            for child in self.root.winfo_children():
+                try:
+                    child.configure(state="disabled" if busy else "normal")
+                except tk.TclError:
+                    pass
+            self.root.update_idletasks()
 
-        sound_url = extract_sound_url(self.video_path.name)
+        self._call_in_ui(toggle, wait=True)
+
+    def _call_in_ui(self, func, wait: bool = False):
+        if threading.current_thread() is self.ui_thread:
+            return func()
+        if wait:
+            done = threading.Event()
+            result = {}
+
+            def wrapper():
+                result["value"] = func()
+                done.set()
+
+            self.root.after(0, wrapper)
+            done.wait()
+            return result.get("value")
+        self.root.after(0, func)
+
+    def _show_info(self, message: str):
+        self._call_in_ui(lambda: messagebox.showinfo("Success", message))
+
+    def _show_error(self, message: str):
+        self._call_in_ui(lambda: messagebox.showerror("Error", message))
+
+    def _confirm_overwrite(self, path: Path) -> bool:
+        return bool(
+            self._call_in_ui(lambda: messagebox.askyesno("File exists", f"'{path.name}' exists. Overwrite?"), wait=True)
+        )
+
+    # ---- Processing ----
+    def _process_inject(self, config: JobConfig):
+        sound_url = extract_sound_url(config.source_path.name)
         if not sound_url:
-            raise ValueError("No [sound=URL] tag found in filename (case-insensitive).")
+            raise RuntimeError("No [sound=URL] tag found in filename.")
 
-        working_dir = get_script_directory()
-        audio_ext = Path(urllib.parse.urlparse(sound_url).path).suffix
-        downloaded_audio = working_dir / f"__downloaded{audio_ext}"
-        converted_audio = working_dir / "__converted.aac"
+        mime = detect_mime(config.source_path)
+        is_video = mime in SUPPORTED_VIDEO_TYPES
+        is_image = mime in SUPPORTED_IMAGE_TYPES
+        if not (is_video or is_image):
+            raise RuntimeError("Source must be a video or image when injecting audio.")
+        self.log(f"Injecting audio into {'video' if is_video else 'image'}: {config.source_path.name}")
 
-        temp_output = self.video_path.with_name("__injected.mp4")
-        try:
+        with safe_tempdir() as temp_dir:
+            tmpdir = Path(temp_dir)
+            downloaded_audio = tmpdir / "downloaded_audio"
+            converted_audio = tmpdir / ("audio.aac" if config.container == "mp4" else "audio.opus")
+            self.log(f"Downloading audio from: {sound_url}")
             download_audio(sound_url, downloaded_audio)
-            prepare_audio_for_muxing(downloaded_audio, converted_audio)
-            mux_video_with_aac_audio(self.video_path, converted_audio, temp_output)
-            clean_stem = re.sub(r'\[sound=.*?\]', '', self.video_path.stem, flags=re.IGNORECASE).strip()
-            final_output = self.video_path.with_name(f"{clean_stem}.mp4")
-            if final_output.exists():
-                overwrite = messagebox.askyesno(
-                    "File exists",
-                    f"'{final_output.name}' already exists.\nDo you want to overwrite it?"
-                )
-                if not overwrite:
-                    self.set_status("Operation cancelled by user.")
-                    temp_output.unlink(missing_ok=True)
-                    return
-            if not self.preserve_original.get():
-                self.video_path.unlink(missing_ok=True)
-            temp_output.replace(final_output)
-            self.set_status(f"Created: {final_output.name}")
-            messagebox.showinfo("Success", f"Created: {final_output.name}")
-        finally:
-            for f in [downloaded_audio, converted_audio, temp_output]:
-                try:
-                    if f.exists():
-                        f.unlink()
-                except Exception:
-                    pass
+            self.log("Converting audio to match container...")
+            if config.container == "mp4":
+                convert_audio_to_aac(downloaded_audio, converted_audio)
+            else:
+                convert_audio_to_opus(downloaded_audio, converted_audio)
 
-    def extract_audio(self):
-        self.set_status("Extracting audio and preparing soundpost...")
-        working_dir = get_script_directory()
-        temp_audio = working_dir / "__extracted.mp3"
-        temp_video = working_dir / "__stripped.mp4"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=working_dir) as tf:
-            safe_video_path = Path(tf.name)
-            shutil.copy2(self.video_path, safe_video_path)
-        try:
-            extract_audio_ffmpeg(safe_video_path, temp_audio)
-            if not temp_audio.exists() or temp_audio.stat().st_size < 1024:
+            output_suffix = f".{config.container}"
+            final_stem = clean_stem(config.source_path.stem)
+            final_output = config.source_path.with_name(f"{final_stem}{output_suffix}")
+
+            temp_output = tmpdir / f"output{output_suffix}"
+            if is_image:
+                self.log("Rendering still image to video with audio...")
+                build_video_from_image(config.source_path, converted_audio, temp_output, config.container)
+            else:
+                self.log("Muxing audio and video with normalization...")
+                mux_video_and_audio(config.source_path, converted_audio, temp_output, config.container)
+
+            if final_output.exists():
+                if not self._confirm_overwrite(final_output):
+                    self.log("Operation cancelled: existing file not overwritten.")
+                    return
+            if not config.preserve_original and config.source_path.exists():
+                config.source_path.unlink()
+            shutil.move(str(temp_output), str(final_output))
+            self.log(f"Created: {final_output.name}")
+            self._show_info(f"Created: {final_output.name}")
+
+    def _process_extract(self, config: JobConfig):
+        mime = detect_mime(config.source_path)
+        if mime not in SUPPORTED_VIDEO_TYPES:
+            raise RuntimeError("Extraction mode requires a video file.")
+        self.log(f"Extracting audio from: {config.source_path.name}")
+
+        with safe_tempdir() as temp_dir:
+            tmpdir = Path(temp_dir)
+            audio_out = tmpdir / "extracted.mp3"
+            silent_video = tmpdir / f"silent.{config.container}"
+
+            self.log("Running ffmpeg to extract audio...")
+            run_ffmpeg(["ffmpeg", "-y", "-i", str(config.source_path), "-vn", "-acodec", "libmp3lame", str(audio_out)])
+            if not audio_out.exists() or audio_out.stat().st_size < 1024:
                 raise RuntimeError("Audio extraction failed.")
-            catbox_url = upload_to_catbox(temp_audio)
-            self.set_status(f"Audio uploaded: {catbox_url}")
-            compress_and_strip_audio(safe_video_path, temp_video)
-            base = self.video_path.stem
-            clean_base = re.sub(r'\[sound=.*?\]', '', base, flags=re.IGNORECASE).strip()
-            quoted_url = urllib.parse.quote(catbox_url, safe='')
-            new_filename = f"{clean_base} [sound={quoted_url}]{self.video_path.suffix}"
-            final_output = self.video_path.with_name(new_filename)
-            if final_output.exists():
-                overwrite = messagebox.askyesno(
-                    "File exists",
-                    f"'{final_output.name}' already exists.\nDo you want to overwrite it?"
-                )
-                if not overwrite:
-                    self.set_status("Operation cancelled by user.")
-                    temp_video.unlink(missing_ok=True)
-                    return
-            if not self.preserve_original.get():
-                self.video_path.unlink(missing_ok=True)
-            temp_video.replace(final_output)
-            self.set_status(f"Created: {final_output.name}\n[sound] tag points to audio uploaded to Catbox.")
-            messagebox.showinfo("Success", f"Created: {final_output.name}\n[sound] tag points to audio uploaded to Catbox.")
-        finally:
-            for f in [temp_audio, temp_video, safe_video_path]:
-                try:
-                    if f.exists():
-                        f.unlink()
-                except Exception:
-                    pass
 
-# === Launch GUI ===
-if __name__ == "__main__":
+            self.log("Uploading audio to Catbox...")
+            catbox_url = upload_to_catbox(audio_out)
+            self.log(f"Audio uploaded: {catbox_url}")
+
+            self.log("Stripping audio and recompressing video to target size...")
+            strip_audio_and_compress(config.source_path, silent_video, config.container, config.target_mb)
+
+            base_name = clean_stem(config.source_path.stem)
+            quoted_url = urllib.parse.quote(catbox_url, safe="")
+            new_name = f"{base_name} [sound={quoted_url}].{config.container}"
+            final_output = config.source_path.with_name(new_name)
+
+            if final_output.exists():
+                if not self._confirm_overwrite(final_output):
+                    self.log("Operation cancelled: existing file not overwritten.")
+                    return
+            if not config.preserve_original and config.source_path.exists():
+                config.source_path.unlink()
+            shutil.move(str(silent_video), str(final_output))
+            self.log(f"Created: {final_output.name}\n[sound] tag points to uploaded audio.")
+            self._show_info(f"Created: {final_output.name}")
+
+
+def main():
+    if not ensure_ffmpeg():
+        print("ffmpeg/ffprobe not found in PATH. Install them before running the GUI.")
+        sys.exit(1)
     root = ThemedTk(theme="equilux")
-    app = SoundpostTool(root)
+    app = SoundpostApp(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
